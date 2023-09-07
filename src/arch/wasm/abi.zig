@@ -43,7 +43,12 @@ pub fn classifyType(ty: Type, mod: *Module) [2]Class {
             }
             return classifyType(field.ty, mod);
         },
-        .Int, .Enum, .ErrorSet, .Vector => {
+        .Vector => {
+            const bits = ty.bitSize(mod);
+            if (bits <= 128) return direct;
+            return memory;
+        },
+        .Int, .Enum, .ErrorSet => {
             const int_bits = ty.intInfo(mod).bits;
             if (int_bits <= 64) return direct;
             if (int_bits <= 128) return .{ .direct, .direct };

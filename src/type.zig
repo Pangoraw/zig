@@ -2175,6 +2175,14 @@ pub const Type = struct {
         };
     }
 
+    /// Returns true if and only if the type is a bool.
+    pub fn isBool(ty: Type, mod: *const Module) bool {
+        return switch (ty.zigTypeTag(mod)) {
+            .Bool => true,
+            else => false,
+        };
+    }
+
     /// Returns true if and only if the type is a fixed-width integer.
     pub fn isInt(self: Type, mod: *const Module) bool {
         return self.isSignedInt(mod) or self.isUnsignedInt(mod);

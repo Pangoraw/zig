@@ -1792,7 +1792,7 @@ const SimdStoreStrategy = enum {
 /// it using a instruction, rather than an unrolled version.
 fn determineSimdStoreStrategy(ty: Type, mod: *Module) SimdStoreStrategy {
     std.debug.assert(ty.zigTypeTag(mod) == .Vector);
-    if (ty.bitSize(mod) != 128) return .unrolled;
+    if (ty.abiSize(mod) != 128 / 8) return .unrolled;
     const hasFeature = std.Target.wasm.featureSetHas;
     const target = mod.getTarget();
     const features = target.cpu.features;
@@ -3488,8 +3488,70 @@ fn cmpFloat16(func: *CodeGen, lhs: WValue, rhs: WValue, op: std.math.CompareOper
 }
 
 fn airCmpVector(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
-    _ = inst;
-    return func.fail("TODO implement airCmpVector for wasm", .{});
+    const mod = func.bin_file.base.options.module.?;
+    const ty_pl = func.air.instructions.items(.data)[inst].ty_pl;
+    const vector_cmp = func.air.extraData(Air.VectorCmp, ty_pl.payload).data;
+
+    const vector_ty = func.typeOf(vector_cmp.lhs);
+
+    if (isByRef(vector_ty, mod)) {
+        const s = vector_ty.bitSize(mod);
+        return func.fail("TODO implement airCmpVector for ref wasm v{}", .{s});
+    }
+
+    const lhs = try func.resolveInst(vector_cmp.lhs);
+    const rhs = try func.resolveInst(vector_cmp.rhs);
+    std.debug.assert(vector_ty.bitSize(mod) == 128);
+
+    const elem_ty = vector_ty.childType(mod);
+    std.debug.assert(elem_ty.bitSize(mod) == 8);
+
+    try func.emitWValue(lhs);
+    try func.emitWValue(rhs);
+
+    const opcode: wasm.SimdOpcode = switch (vector_cmp.compareOperator()) {
+        .lt => .i8x16_lt_s,
+        .lte => .i8x16_le_s,
+        .eq => .i8x16_eq,
+        .neq => .i8x16_ne,
+        .gt => .i8x16_gt_s,
+        .gte => .i8x16_ge_s,
+    };
+
+    const output_ty = func.air.getRefType(ty_pl.ty);
+    std.debug.assert(output_ty.bitSize(mod) == 16);
+    std.debug.assert(output_ty.childType(mod).bitSize(mod) == 1);
+
+    {
+        const operands = [_]u32{ std.wasm.simdOpcode(opcode) };
+        const extra_index = @as(u32, @intCast(func.mir_extra.items.len));
+        try func.mir_extra.appendSlice(func.gpa, &operands);
+        try func.addInst(.{ .tag = .simd_prefix, .data = .{ .payload = extra_index } });
+    }
+
+    {
+        const operands = [_]u32{ std.wasm.simdOpcode(.i8x16_bitmask) };
+        const extra_index = @as(u32, @intCast(func.mir_extra.items.len));
+        try func.mir_extra.appendSlice(func.gpa, &operands);
+        try func.addInst(.{ .tag = .simd_prefix, .data = .{ .payload = extra_index } });
+    }
+
+    const value = try func.allocLocal(Type.@"i32");
+    try func.addLabel(.local_set, value.local.value);
+
+    var output: WValue = .stack;
+    switch (determineSimdStoreStrategy(output_ty, mod)) {
+        .direct => {
+            output = try func.allocLocal(output_ty);
+            try func.addLabel(.local_set, output.local.value);
+        },
+        .unrolled => {
+            output = try func.allocStack(output_ty);
+            try func.store(output, value, Type.@"i32", 0);
+        }
+    }
+
+    return func.finishAir(inst, output, &.{vector_cmp.lhs, vector_cmp.rhs});
 }
 
 fn airCmpLtErrorsLen(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
@@ -3595,6 +3657,7 @@ fn airUnreachable(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
 }
 
 fn airBitcast(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
+    const mod = func.bin_file.base.options.module.?;
     const ty_op = func.air.instructions.items(.data)[inst].ty_op;
     const result = result: {
         const operand = try func.resolveInst(ty_op.operand);
@@ -3603,6 +3666,10 @@ fn airBitcast(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
         if (given_ty.isAnyFloat() or wanted_ty.isAnyFloat()) {
             const bitcast_result = try func.bitcast(wanted_ty, given_ty, operand);
             break :result try bitcast_result.toLocal(func, wanted_ty);
+        }
+        if (!isByRef(wanted_ty, mod) and isByRef(given_ty, mod) and wanted_ty.isVector(mod)) {
+            const vload = try func.load(operand, wanted_ty, 0);
+            break :result try vload.toLocal(func, wanted_ty);
         }
         break :result func.reuseOperand(ty_op.operand, operand);
     };
@@ -4735,8 +4802,13 @@ fn airArrayElemVal(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
     if (isByRef(array_ty, mod)) {
         try func.lowerToStack(array);
         try func.emitWValue(index);
-        try func.addImm32(@as(i32, @bitCast(@as(u32, @intCast(elem_size)))));
-        try func.addTag(.i32_mul);
+        if (array_ty.isVector(mod) and elem_ty.isBool(mod)) {
+            try func.addImm32(8);
+            try func.addTag(.i32_div_u);
+        } else {
+            try func.addImm32(@as(i32, @bitCast(@as(u32, @intCast(elem_size)))));
+            try func.addTag(.i32_mul);
+        }
         try func.addTag(.i32_add);
     } else {
         std.debug.assert(array_ty.zigTypeTag(mod) == .Vector);
@@ -4785,6 +4857,19 @@ fn airArrayElemVal(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
         defer result.free(func); // only free if no longer needed and not returned like above
 
         const elem_val = try func.load(result, elem_ty, 0);
+        if (!array_ty.isVector(mod) or !elem_ty.isBool(mod)) {
+            break :val try elem_val.toLocal(func, elem_ty);
+        }
+
+        try func.emitWValue(index);
+
+        try func.addImm32(8);
+        try func.addTag(.i32_rem_u);
+        try func.addTag(.i32_shr_u);
+
+        try func.addImm32(0x01);
+        try func.addTag(.i32_and);
+
         break :val try elem_val.toLocal(func, elem_ty);
     };
 
@@ -4914,10 +4999,22 @@ fn airSplat(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
 }
 
 fn airSelect(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
-    const pl_op = func.air.instructions.items(.data)[inst].pl_op;
-    const operand = try func.resolveInst(pl_op.operand);
+    _ = inst;
+    // const mod = func.bin_file.base.options.module.?;
+    // const inst_ty = func.typeOfIndex(inst);
+    // const pl_op = func.air.instructions.items(.data)[inst].pl_op;
+    // const operand = try func.resolveInst(pl_op.operand);
+    // const extra = func.air.extraData(Air.Bin, pl_op.payload).data;
 
-    _ = operand;
+    // const lhs = try func.resolveInst(extra.lhs);
+    // const rhs = try func.resolveInst(extra.rhs);
+
+    // const child_ty = inst_ty.childType(mod);
+    // const elem_size = child_ty.abiSize(mod);
+
+    // if (isByRef(inst_ty))
+    //     return func.fail("TODO: airSelect byRef", .{});
+
     return func.fail("TODO: Implement wasm airSelect", .{});
 }
 
