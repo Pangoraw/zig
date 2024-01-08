@@ -915,6 +915,12 @@ fn addExtended(func: *CodeGen, opcode: wasm.MiscOpcode) error{OutOfMemory}!void 
     try func.addInst(.{ .tag = .misc_prefix, .data = .{ .payload = extra_index } });
 }
 
+fn addSimd(func: *CodeGen, opcode: wasm.SimdOpcode) error{OutOfMemory}!void {
+    const extra_index = @as(u32, @intCast(func.mir_extra.items.len));
+    try func.mir_extra.append(func.gpa, wasm.simdOpcode(opcode));
+    try func.addInst(.{ .tag = .simd_prefix, .data = .{ .payload = extra_index } });
+}
+
 fn addLabel(func: *CodeGen, tag: Mir.Inst.Tag, label: u32) error{OutOfMemory}!void {
     try func.addInst(.{ .tag = tag, .data = .{ .label = label } });
 }
@@ -2672,18 +2678,18 @@ fn binOpBigInt(func: *CodeGen, lhs: WValue, rhs: WValue, ty: Type, op: Op) Inner
         .rem => return func.callIntrinsic("__umodti3", &.{ ty.toIntern(), ty.toIntern() }, ty, &.{ lhs, rhs }),
         .shr => return func.callIntrinsic("__lshrti3", &.{ ty.toIntern(), .i32_type }, ty, &.{ lhs, rhs }),
         .shl => return func.callIntrinsic("__ashlti3", &.{ ty.toIntern(), .i32_type }, ty, &.{ lhs, rhs }),
-        .xor => {
+        .xor, .@"and", .@"or" => {
             const result = try func.allocStack(ty);
             try func.emitWValue(result);
             const lhs_high_bit = try func.load(lhs, Type.u64, 0);
             const rhs_high_bit = try func.load(rhs, Type.u64, 0);
-            const xor_high_bit = try func.binOp(lhs_high_bit, rhs_high_bit, Type.u64, .xor);
+            const xor_high_bit = try func.binOp(lhs_high_bit, rhs_high_bit, Type.u64, op);
             try func.store(.stack, xor_high_bit, Type.u64, result.offset());
 
             try func.emitWValue(result);
             const lhs_low_bit = try func.load(lhs, Type.u64, 8);
             const rhs_low_bit = try func.load(rhs, Type.u64, 8);
-            const xor_low_bit = try func.binOp(lhs_low_bit, rhs_low_bit, Type.u64, .xor);
+            const xor_low_bit = try func.binOp(lhs_low_bit, rhs_low_bit, Type.u64, op);
             try func.store(.stack, xor_low_bit, Type.u64, result.offset() + 8);
             return result;
         },
@@ -2711,6 +2717,20 @@ fn binOpBigInt(func: *CodeGen, lhs: WValue, rhs: WValue, ty: Type, op: Op) Inner
 
             try func.store(result, high_op_res, Type.u64, 0);
             try func.store(result, tmp_op, Type.u64, 8);
+            return result;
+        },
+        .min, .max => {
+            const result = try func.allocStack(ty);
+
+            try func.lowerToStack(lhs);
+            try func.lowerToStack(rhs);
+            _ = try func.cmpBigInt(lhs, rhs, ty, if (op == .max) .gt else .lt);
+            try func.addTag(.select);
+            var addr = try (WValue{ .stack = {} }).toLocal(func, Type.i32);
+            defer addr.free(func);
+
+            try func.memcpy(result, addr, WValue{ .imm32 = @intCast(ty.abiSize(mod)) });
+
             return result;
         },
         else => return func.fail("TODO: Implement binary operation for big integers: '{s}'", .{@tagName(op)}),
@@ -3705,8 +3725,176 @@ fn cmpFloat(func: *CodeGen, ty: Type, lhs: WValue, rhs: WValue, cmp_op: std.math
 }
 
 fn airCmpVector(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
-    _ = inst;
-    return func.fail("TODO implement airCmpVector for wasm", .{});
+    const mod = func.bin_file.base.comp.module.?;
+    const ty_pl = func.air.instructions.items(.data)[@intFromEnum(inst)].ty_pl;
+    const extra = func.air.extraData(Air.VectorCmp, ty_pl.payload).data;
+    const inst_ty = func.typeOfIndex(inst);
+
+    const lhs_ty = func.typeOf(extra.lhs);
+    const rhs_ty = func.typeOf(extra.rhs);
+
+    const lhs_elem_ty = lhs_ty.childType(mod);
+    const rhs_elem_ty = rhs_ty.childType(mod);
+
+    const lhs_wasm_ty = typeToValtype(lhs_elem_ty, mod);
+    const rhs_wasm_ty = typeToValtype(rhs_elem_ty, mod);
+
+    const SideToConvert = enum { left, right, none };
+    const elem_ty: Type, const side_to_convert: SideToConvert = switch (std.math.order(lhs_elem_ty.bitSize(mod), rhs_elem_ty.bitSize(mod))) {
+        .eq => .{ lhs_elem_ty, .none },
+        .gt => .{ lhs_elem_ty, .right },
+        .lt => .{ rhs_elem_ty, .left },
+    };
+
+    const elem_byte_size = elem_ty.abiSize(mod);
+    const lhs = try func.resolveInst(extra.lhs);
+    const rhs = try func.resolveInst(extra.rhs);
+
+    const vector_len = @as(usize, @intCast(inst_ty.vectorLen(mod)));
+
+    if (determineSimdStoreStrategy(lhs_ty, mod) == .direct and
+        determineSimdStoreStrategy(rhs_ty, mod) == .direct)
+    {
+        const cmp_opcode: wasm.SimdOpcode = switch (elem_ty.bitSize(mod)) {
+            8 => switch (extra.compareOperator()) {
+                .eq => .i8x16_eq,
+                .lte => if (elem_ty.isSignedInt(mod)) .i8x16_le_s else .i8x16_le_u,
+                .lt => if (elem_ty.isSignedInt(mod)) .i8x16_lt_s else .i8x16_lt_u,
+                .gte => if (elem_ty.isSignedInt(mod)) .i8x16_ge_s else .i8x16_ge_u,
+                .gt => if (elem_ty.isSignedInt(mod)) .i8x16_gt_s else .i8x16_gt_u,
+                .neq => .i8x16_ne,
+            },
+            16 => switch (extra.compareOperator()) {
+                .eq => .i16x8_eq,
+                .lte => if (elem_ty.isSignedInt(mod)) .i16x8_le_s else .i16x8_le_u,
+                .lt => if (elem_ty.isSignedInt(mod)) .i16x8_lt_s else .i16x8_lt_u,
+                .gte => if (elem_ty.isSignedInt(mod)) .i16x8_ge_s else .i16x8_ge_u,
+                .gt => if (elem_ty.isSignedInt(mod)) .i16x8_gt_s else .i16x8_gt_u,
+                .neq => .i16x8_ne,
+            },
+            32 => if (elem_ty.isRuntimeFloat())
+                switch (extra.compareOperator()) {
+                    .eq => .f32x4_eq,
+                    .lte => .f32x4_le,
+                    .lt => .f32x4_lt,
+                    .gte => .f32x4_ge,
+                    .gt => .f32x4_gt,
+                    .neq => .f32x4_ne,
+                }
+            else switch (extra.compareOperator()) {
+                .eq => .i32x4_eq,
+                .lte => if (elem_ty.isSignedInt(mod)) .i32x4_le_s else .i32x4_le_u,
+                .lt => if (elem_ty.isSignedInt(mod)) .i32x4_lt_s else .i32x4_lt_u,
+                .gte => if (elem_ty.isSignedInt(mod)) .i32x4_ge_s else .i32x4_ge_u,
+                .gt => if (elem_ty.isSignedInt(mod)) .i32x4_gt_s else .i32x4_gt_u,
+                .neq => .i32x4_ne,
+            },
+            64 => if (elem_ty.isRuntimeFloat())
+                switch (extra.compareOperator()) {
+                    .eq => .f64x2_eq,
+                    .lte => .f64x2_le,
+                    .lt => .f64x2_lt,
+                    .gte => .f64x2_ge,
+                    .gt => .f64x2_gt,
+                    .neq => .f64x2_ne,
+                }
+            else switch (extra.compareOperator()) {
+                .eq => .i64x2_eq,
+                .lte => .i64x2_le_s,
+                .lt => .i64x2_lt_s,
+                .gte => .i64x2_ge_s,
+                .gt => .i64x2_gt_s,
+                .neq => .i64x2_ne,
+            },
+            128 => switch (extra.compareOperator()) {
+                .neq => .v128_xor,
+                else => return func.fail("could not handle airCmpVector for type {}", .{lhs_ty.fmt(mod)}),
+            },
+            else => return func.fail("could not handle airCmpVector for type {}", .{lhs_ty.fmt(mod)}),
+        };
+        const bitmask_opcode: wasm.SimdOpcode = switch (elem_ty.bitSize(mod)) {
+            8 => .i8x16_bitmask,
+            16 => .i16x8_bitmask,
+            32 => .i32x4_bitmask,
+            64 => .i64x2_bitmask,
+            128 => .v128_any_true,
+            else => return func.fail("could not handle airCmpVector for type {}", .{lhs_ty.fmt(mod)}),
+        };
+
+        const result = try func.allocStack(inst_ty);
+        try func.emitWValue(result);
+
+        try func.emitWValue(lhs);
+        try func.emitWValue(rhs);
+
+        try func.addSimd(cmp_opcode);
+        try func.addSimd(bitmask_opcode);
+
+        // corresponding bit packed type for result vector
+        const res_ty = switch (vector_len) {
+            1 => Type.u1,
+            2, 4, 8 => Type.u8,
+            16 => Type.u16,
+            else => unreachable,
+        };
+        assert(res_ty.abiSize(mod) == inst_ty.abiSize(mod));
+
+        // result is already on the stack
+        try func.store(.stack, .stack, res_ty, 0);
+        func.finishAir(inst, result, &.{ extra.lhs, extra.rhs });
+        return;
+    }
+
+    var result = try func.allocStack(inst_ty);
+    var current = try func.allocLocal(Type.u8);
+
+    // TODO: use v128 cmp for first "blocks".
+    for (0..vector_len) |index| {
+        const index_in_block = index % 8;
+
+        var lhs_el = try func.load(lhs, lhs_elem_ty, @intCast(elem_byte_size * index));
+        if (side_to_convert == .left) {
+            const signedness = if (rhs_ty.isInt(mod)) rhs_ty.intInfo(mod).signedness else null;
+            lhs_el = try func.convert(
+                lhs_el,
+                lhs_wasm_ty,
+                rhs_wasm_ty,
+                signedness,
+            );
+        }
+        var rhs_el = try func.load(rhs, rhs_elem_ty, @intCast(elem_byte_size * index));
+        if (side_to_convert == .right) {
+            const signedness = if (lhs_ty.isInt(mod)) lhs_ty.intInfo(mod).signedness else null;
+            rhs_el = try func.convert(
+                rhs_el,
+                rhs_wasm_ty,
+                lhs_wasm_ty,
+                signedness,
+            );
+        }
+
+        var val = try func.cmp(lhs_el, rhs_el, elem_ty, extra.compareOperator());
+        if (index_in_block != 0) {
+            val = try func.binOp(val, WValue{ .imm32 = @intCast(index_in_block) }, Type.u8, .shl);
+            val = try func.binOp(val, current, Type.u8, .@"or");
+        }
+        try func.addLabel(.local_set, current.local.value);
+
+        if (index_in_block == 7 or index == vector_len - 1) {
+            const offset_to_store = @divFloor(index - 1, 8);
+            try func.store(result, current, Type.u8, @intCast(offset_to_store));
+        }
+    }
+    current.free(func);
+
+    // TODO: store result as a v128 from the start instead of allocating a stack slot.
+    if (determineSimdStoreStrategy(inst_ty, mod) == .direct) {
+        _ = try func.load(result, inst_ty, 0);
+        result = try func.allocLocal(inst_ty);
+        try func.addLabel(.local_set, result.local.value);
+    }
+
+    func.finishAir(inst, result, &.{ extra.lhs, extra.rhs });
 }
 
 fn airCmpLtErrorsLen(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
@@ -4966,15 +5154,103 @@ fn memset(func: *CodeGen, elem_ty: Type, ptr: WValue, len: WValue, value: WValue
     try func.endBlock();
 }
 
-fn airArrayElemVal(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
-    const mod = func.bin_file.base.comp.module.?;
-    const bin_op = func.air.instructions.items(.data)[@intFromEnum(inst)].bin_op;
+// Handles storing to packed vectors
+fn storeToBitArray(func: *CodeGen, array: WValue, index: WValue, value: WValue, array_ty: Type) InnerError!void {
+    assert(index != .stack);
+    assert(value != .stack);
 
-    const array_ty = func.typeOf(bin_op.lhs);
-    const array = try func.resolveInst(bin_op.lhs);
-    const index = try func.resolveInst(bin_op.rhs);
+    const mod = func.bin_file.base.comp.module.?;
     const elem_ty = array_ty.childType(mod);
+    const elem_bit_size = elem_ty.bitSize(mod);
+    assert(elem_bit_size == 1);
+
+    // array[index / 8] = array[index / 8] & ~(1 << (index % 8)) | (v << (index % 8))
+
+    try func.lowerToStack(array);
+    try func.emitWValue(index);
+    var item_addr: WValue = .stack;
+    item_addr = try func.binOp(item_addr, WValue{ .imm32 = 8 }, Type.u32, .div);
+    item_addr = try func.binOp(.stack, item_addr, Type.u32, .add);
+    item_addr = try item_addr.toLocal(func, Type.u32);
+    defer item_addr.free(func);
+
+    var shift_amount = try (try func.binOp(index, WValue{ .imm32 = 8 }, Type.u32, .rem)).toLocal(func, Type.i32);
+    defer shift_amount.free(func);
+
+    const previous_value = try func.load(item_addr, elem_ty, 0);
+    var mask = try func.binOp(WValue{ .imm32 = 1 }, shift_amount, Type.u32, .shl);
+    mask = try func.binOp(mask, WValue{ .imm32 = ~@as(u32, 0) }, Type.u32, .xor);
+
+    const masked_previous_value = try func.binOp(previous_value, mask, Type.u32, .@"and");
+    const shifted_value = try func.binOp(value, shift_amount, Type.u32, .shl);
+
+    const new_value = try (try func.binOp(masked_previous_value, shifted_value, Type.u32, .@"or")).toLocal(func, Type.u32);
+
+    return func.store(item_addr, new_value, elem_ty, 0);
+}
+
+// Handles loading from packed vectors, leaves the value on the stack.
+fn loadFromArray(func: *CodeGen, array: WValue, index: WValue, array_ty: Type) InnerError!WValue {
+    const mod = func.bin_file.base.comp.module.?;
+    const elem_ty = array_ty.childType(mod);
+
     const elem_size = elem_ty.abiSize(mod);
+    const elem_bit_size = elem_ty.bitSize(mod);
+    const vector_len = @as(usize, @intCast(array_ty.vectorLen(mod)));
+
+    if (elem_bit_size % 8 != 0 and isByRef(array_ty, mod)) {
+        // (array[index * elem_bit_size / sz] >> (index % sz)) & 0x11
+
+        if (elem_bit_size > 64) {
+            return func.fail("TODO: handle load from vector of type {}", .{array_ty.fmt(mod)});
+        }
+
+        const load_ty = load_ty_blk: {
+            const load_ty = switch (elem_bit_size) {
+                1...8 => Type.u8,
+                9...16 => Type.u16,
+                17...32 => Type.u32,
+                33...64 => Type.u64,
+                else => unreachable,
+            };
+            const load_ty_size = load_ty.bitSize(mod);
+            if (load_ty_size % elem_bit_size != 0 and elem_bit_size * vector_len > load_ty_size) {
+                break :load_ty_blk switch (load_ty_size) {
+                    8 => Type.u16,
+                    16 => Type.u32,
+                    32 => Type.u64,
+                    else => unreachable,
+                };
+            }
+            break :load_ty_blk load_ty;
+        };
+        const load_ty_size = load_ty.bitSize(mod);
+
+        try func.lowerToStack(array);
+        try func.emitWValue(index);
+        const bit_index = try (try func.binOp(.stack, WValue{ .imm32 = @intCast(elem_bit_size) }, Type.u32, .mul)).toLocal(func, Type.u32);
+        var val = try func.binOp(.stack, WValue{ .imm32 = @intCast(load_ty_size) }, Type.u32, .div);
+        std.debug.assert(val == .stack);
+        try func.addTag(.i32_add);
+        const index_val = try func.load(.stack, load_ty, 0);
+        try func.emitWValue(index);
+
+        switch (toWasmBits(@intCast(load_ty_size)).?) {
+            32 => {
+                val = try func.binOp(.stack, WValue{ .imm32 = @intCast(load_ty_size) }, load_ty, .rem);
+                val = try func.binOp(index_val, val, load_ty, .shr);
+                val = try func.binOp(val, WValue{ .imm32 = (@as(u32, 1) << @as(u5, @intCast(elem_bit_size))) - @as(u32, 1) }, load_ty, .@"and");
+            },
+            64 => {
+                val = try func.binOp(.stack, WValue{ .imm64 = @intCast(load_ty_size) }, load_ty, .rem);
+                val = try func.binOp(index_val, val, load_ty, .shr);
+                val = try func.binOp(val, WValue{ .imm64 = (@as(u64, 1) << @as(u6, @intCast(elem_bit_size))) - @as(u64, 1) }, load_ty, .@"and");
+            },
+            else => unreachable,
+        }
+
+        return val;
+    }
 
     if (isByRef(array_ty, mod)) {
         try func.lowerToStack(array);
@@ -4983,7 +5259,85 @@ fn airArrayElemVal(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
         try func.addTag(.i32_mul);
         try func.addTag(.i32_add);
     } else {
-        std.debug.assert(array_ty.zigTypeTag(mod) == .Vector);
+        switch (index) {
+            inline .imm32, .imm64 => |lane| {
+                const opcode: wasm.SimdOpcode = switch (elem_ty.bitSize(mod)) {
+                    8 => if (elem_ty.isSignedInt(mod)) .i8x16_extract_lane_s else .i8x16_extract_lane_u,
+                    16 => if (elem_ty.isSignedInt(mod)) .i16x8_extract_lane_s else .i16x8_extract_lane_u,
+                    32 => if (elem_ty.isInt(mod)) .i32x4_extract_lane else .f32x4_extract_lane,
+                    64 => if (elem_ty.isInt(mod)) .i64x2_extract_lane else .f64x2_extract_lane,
+                    else => unreachable,
+                };
+
+                var operands = [_]u32{ std.wasm.simdOpcode(opcode), @as(u8, @intCast(lane)) };
+
+                try func.emitWValue(array);
+
+                const extra_index = @as(u32, @intCast(func.mir_extra.items.len));
+                try func.mir_extra.appendSlice(func.gpa, &operands);
+                try func.addInst(.{ .tag = .simd_prefix, .data = .{ .payload = extra_index } });
+
+                return .stack;
+            },
+            else => {
+                const stack_vec = try func.allocStack(array_ty);
+                try func.store(stack_vec, array, array_ty, 0);
+
+                // Is a non-unrolled vector (v128)
+                try func.lowerToStack(stack_vec);
+                try func.emitWValue(index);
+                try func.addImm32(@as(i32, @bitCast(@as(u32, @intCast(elem_size)))));
+                try func.addTag(.i32_mul);
+                try func.addTag(.i32_add);
+            },
+        }
+    }
+
+    std.debug.assert(!isByRef(elem_ty, mod));
+    return func.load(.stack, elem_ty, 0);
+}
+
+fn airArrayElemVal(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
+    const mod = func.bin_file.base.comp.module.?;
+    const bin_op = func.air.instructions.items(.data)[@intFromEnum(inst)].bin_op;
+
+    const array_ty = func.typeOf(bin_op.lhs);
+    const array = try func.resolveInst(bin_op.lhs);
+    const index = try func.resolveInst(bin_op.rhs);
+    const elem_ty = array_ty.childType(mod);
+
+    const is_vector = array_ty.zigTypeTag(mod) == .Vector;
+    const elem_bit_size = elem_ty.bitSize(mod);
+    const elem_size = elem_ty.abiSize(mod);
+
+    if (isByRef(array_ty, mod)) {
+        if (is_vector and elem_bit_size == 1) { // @Vector(N, bool)
+            // (array[index / 8] >> (index % 8)) & 0x01
+            try func.lowerToStack(array);
+            try func.emitWValue(index);
+            var val = try func.binOp(.stack, WValue{ .imm32 = 8 }, Type.u32, .div); // index / 8
+            std.debug.assert(val == .stack);
+            try func.addTag(.i32_add);
+            const index_val = try func.load(
+                .stack,
+                Type.u8,
+                0,
+            );
+            try func.emitWValue(index);
+            val = try func.binOp(val, WValue{ .imm32 = 8 }, Type.u8, .rem); // index % 8
+            val = try func.binOp(index_val, val, Type.u8, .shr);
+            val = try func.binOp(val, WValue{ .imm32 = 0x01 }, Type.u8, .@"and"); // & 0x01
+
+            return func.finishAir(inst, try WValue.toLocal(val, func, elem_ty), &.{ bin_op.lhs, bin_op.rhs });
+        }
+
+        try func.lowerToStack(array);
+        try func.emitWValue(index);
+        try func.addImm32(@as(i32, @bitCast(@as(u32, @intCast(elem_size)))));
+        try func.addTag(.i32_mul);
+        try func.addTag(.i32_add);
+    } else {
+        std.debug.assert(is_vector);
 
         switch (index) {
             inline .imm32, .imm64 => |lane| {
@@ -5080,6 +5434,20 @@ fn airIntFromFloat(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
     func.finishAir(inst, result, &.{ty_op.operand});
 }
 
+// Converts operand from Wasm types dst_ty to src_ty, leaves the value on the stack.
+fn convert(func: *CodeGen, operand: WValue, src_ty: wasm.Valtype, dst_ty: wasm.Valtype, signedness: ?std.builtin.Signedness) InnerError!WValue {
+    assert(operand != .stack_offset);
+    try func.emitWValue(operand);
+    const op = buildOpcode(.{
+        .op = .convert,
+        .valtype1 = src_ty,
+        .valtype2 = dst_ty,
+        .signedness = signedness,
+    });
+    try func.addTag(Mir.Inst.Tag.fromOpcode(op));
+    return .stack;
+}
+
 fn airFloatFromInt(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
     const mod = func.bin_file.base.comp.module.?;
     const ty_op = func.air.instructions.items(.data)[@intFromEnum(inst)].ty_op;
@@ -5112,15 +5480,7 @@ fn airFloatFromInt(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
         return func.finishAir(inst, result, &.{ty_op.operand});
     }
 
-    try func.emitWValue(operand);
-    const op = buildOpcode(.{
-        .op = .convert,
-        .valtype1 = typeToValtype(dest_ty, mod),
-        .valtype2 = typeToValtype(op_ty, mod),
-        .signedness = op_info.signedness,
-    });
-    try func.addTag(Mir.Inst.Tag.fromOpcode(op));
-
+    _ = try func.convert(operand, typeToValtype(dest_ty, mod), typeToValtype(op_ty, mod), op_info.signedness);
     const result = try func.allocLocal(dest_ty);
     try func.addLabel(.local_set, result.local.value);
     func.finishAir(inst, result, &.{ty_op.operand});
@@ -5267,11 +5627,132 @@ fn airShuffle(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
 }
 
 fn airReduce(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
+    const mod = func.bin_file.base.comp.module.?;
     const reduce = func.air.instructions.items(.data)[@intFromEnum(inst)].reduce;
     const operand = try func.resolveInst(reduce.operand);
 
-    _ = operand;
-    return func.fail("TODO: Implement wasm airReduce", .{});
+    const array_ty = func.typeOf(reduce.operand);
+    const array_bit_size = array_ty.bitSize(mod);
+
+    const inst_ty = func.typeOfIndex(inst);
+    const inst_bit_size = inst_ty.bitSize(mod);
+
+    const vector_len = @as(usize, @intCast(array_ty.vectorLen(mod)));
+
+    const binop: Op = switch (reduce.operation) {
+        .And => .@"and",
+        .Or => .@"or",
+        .Xor => .xor,
+        .Min => .min,
+        .Max => .max,
+        .Add => .add,
+        .Mul => .mul,
+    };
+
+    // Fast path for small Vector bool type
+    if (inst_bit_size == 1 and binop == .@"or" and (vector_len <= 64 or !isByRef(array_ty, mod))) {
+        if (!isByRef(array_ty, mod)) {
+            try func.emitWValue(operand);
+            try func.addSimd(.v128_any_true);
+        } else {
+            const loaded_ty = if (array_bit_size <= 8)
+                Type.u8
+            else if (array_bit_size <= 16)
+                Type.u16
+            else if (array_bit_size <= 32)
+                Type.u32
+            else if (array_bit_size <= 64)
+                Type.u64
+            else
+                unreachable;
+
+            const is_i32 = typeToValtype(loaded_ty, mod) == wasm.Valtype.i32;
+            _ = try func.load(operand, loaded_ty, 0);
+
+            // Mask padding bits
+            if (!std.math.isPowerOfTwo(array_bit_size) or array_bit_size < 8) {
+                _ = try func.binOp(.stack, if (is_i32)
+                    WValue{ .imm32 = @intCast((@as(u32, 1) << @as(u5, @intCast(array_bit_size))) - 1) }
+                else
+                    WValue{ .imm64 = @intCast((@as(u64, 1) << @as(u6, @intCast(array_bit_size))) - 1) }, loaded_ty, .@"and");
+            }
+
+            const opcode = buildOpcode(.{
+                .valtype1 = typeToValtype(loaded_ty, mod),
+                .op = .ne,
+            });
+            try func.emitWValue(if (is_i32) WValue{ .imm32 = 0 } else WValue{ .imm64 = 0 });
+            try func.addTag(Mir.Inst.Tag.fromOpcode(opcode));
+        }
+
+        const result = try (WValue{ .stack = {} }).toLocal(func, inst_ty);
+        return func.finishAir(inst, result, &.{reduce.operand});
+    }
+
+    if (isByRef(inst_ty, mod)) {
+        if (!isByRef(array_ty, mod) or !inst_ty.isInt(mod)) {
+            return func.fail("TODO: airReduce on vector {}", .{array_ty.fmt(mod)});
+        }
+
+        const inst_byte_size = inst_ty.abiSize(mod);
+
+        var result = operand;
+        for (1..vector_len) |index| {
+            try func.emitWValue(operand);
+            try func.addImm32(@intCast(index * inst_byte_size));
+            try func.addTag(.i32_add);
+
+            var addr = try (WValue{ .stack = {} }).toLocal(func, Type.i32);
+            defer addr.free(func);
+
+            result = try func.binOpBigInt(addr, result, inst_ty, binop);
+        }
+
+        if (vector_len == 1) {
+            const result_slot = try func.allocStack(inst_ty);
+            try func.memcpy(result_slot, result, WValue{ .imm32 = @intCast(inst_byte_size) });
+            result = result_slot;
+        }
+
+        return func.finishAir(inst, result, &.{reduce.operand});
+    }
+
+    var value: WValue = undefined;
+    for (0..vector_len) |index| {
+        value = try func.loadFromArray(operand, WValue{ .imm32 = @intCast(index) }, array_ty);
+
+        if (index > 0) {
+            if (binop == .min or binop == .max) {
+                std.debug.assert(value == .stack);
+
+                if (inst_ty.isInt(mod)) {
+                    var val1 = try func.allocLocal(inst_ty);
+                    defer val1.free(func);
+                    try func.addLabel(.local_set, val1.local.value);
+
+                    var val2 = try func.allocLocal(inst_ty);
+                    defer val2.free(func);
+                    try func.addLabel(.local_set, val2.local.value);
+
+                    try func.emitWValue(val1);
+                    try func.emitWValue(val2);
+                    _ = try func.cmp(val1, val2, inst_ty, if (binop == .max) .gt else .lt);
+
+                    try func.addTag(.select);
+                } else {
+                    try func.floatMaxMin(.stack, value, inst_ty, binop);
+                }
+
+                value = .stack;
+            } else {
+                value = try func.wrapBinOp(.stack, value, inst_ty, binop);
+                std.debug.assert(value == .stack);
+            }
+        }
+    }
+
+    const result = try value.toLocal(func, inst_ty);
+    func.finishAir(inst, result, &.{reduce.operand});
 }
 
 fn airAggregateInit(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
@@ -5284,13 +5765,31 @@ fn airAggregateInit(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
 
     const result: WValue = result_value: {
         switch (result_ty.zigTypeTag(mod)) {
-            .Array => {
+            .Array, .Vector => {
+                if (result_ty.zigTypeTag(mod) == .Vector and !isByRef(result_ty, mod)) {
+                    return func.fail("TODO: Wasm backend: implement airAggregateInit for vectors of type {}", .{result_ty.fmt(mod)});
+                }
                 const result = try func.allocStack(result_ty);
                 const elem_ty = result_ty.childType(mod);
                 const elem_size = @as(u32, @intCast(elem_ty.abiSize(mod)));
+
                 const sentinel = if (result_ty.sentinel(mod)) |sent| blk: {
                     break :blk try func.lowerConstant(sent, elem_ty);
                 } else null;
+
+                if (result_ty.zigTypeTag(mod) == .Vector and elem_ty.bitSize(mod) == 1) {
+                    for (elements, 0..) |elem, index| {
+                        const elem_val = try func.resolveInst(elem);
+                        try func.storeToBitArray(
+                            result,
+                            WValue{ .imm32 = @intCast(index) },
+                            elem_val,
+                            result_ty,
+                        );
+                    }
+                    std.debug.assert(sentinel == null);
+                    break :result_value result;
+                }
 
                 // When the element type is by reference, we must copy the entire
                 // value. It is therefore safer to move the offset pointer and store
@@ -5389,7 +5888,6 @@ fn airAggregateInit(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
                     break :result_value result;
                 },
             },
-            .Vector => return func.fail("TODO: Wasm backend: implement airAggregateInit for vectors", .{}),
             else => unreachable,
         }
     };
@@ -6276,10 +6774,26 @@ fn airMulWithOverflow(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
     func.finishAir(inst, result_ptr, &.{ extra.lhs, extra.rhs });
 }
 
+// Computes the min/max of two floating point values by respecting NaN semantics.
+// leaves the value on the stack.
+fn floatMaxMin(func: *CodeGen, lhs: WValue, rhs: WValue, ty: Type, op: Op) InnerError!void {
+    const mod = func.bin_file.base.comp.module.?;
+    const target = mod.getTarget();
+
+    var fn_name_buf: [64]u8 = undefined;
+    const float_bits = ty.floatBits(target);
+    const fn_name = std.fmt.bufPrint(&fn_name_buf, "{s}f{s}{s}", .{
+        target_util.libcFloatPrefix(float_bits),
+        @tagName(op),
+        target_util.libcFloatSuffix(float_bits),
+    }) catch unreachable;
+    const result = try func.callIntrinsic(fn_name, &.{ ty.ip_index, ty.ip_index }, ty, &.{ lhs, rhs });
+    try func.lowerToStack(result);
+}
+
 fn airMaxMin(func: *CodeGen, inst: Air.Inst.Index, op: Op) InnerError!void {
     assert(op == .max or op == .min);
     const mod = func.bin_file.base.comp.module.?;
-    const target = mod.getTarget();
     const bin_op = func.air.instructions.items(.data)[@intFromEnum(inst)].bin_op;
 
     const ty = func.typeOfIndex(inst);
@@ -6295,15 +6809,7 @@ fn airMaxMin(func: *CodeGen, inst: Air.Inst.Index, op: Op) InnerError!void {
     const rhs = try func.resolveInst(bin_op.rhs);
 
     if (ty.zigTypeTag(mod) == .Float) {
-        var fn_name_buf: [64]u8 = undefined;
-        const float_bits = ty.floatBits(target);
-        const fn_name = std.fmt.bufPrint(&fn_name_buf, "{s}f{s}{s}", .{
-            target_util.libcFloatPrefix(float_bits),
-            @tagName(op),
-            target_util.libcFloatSuffix(float_bits),
-        }) catch unreachable;
-        const result = try func.callIntrinsic(fn_name, &.{ ty.ip_index, ty.ip_index }, ty, &.{ lhs, rhs });
-        try func.lowerToStack(result);
+        try func.floatMaxMin(lhs, rhs, ty, op);
     } else {
         // operands to select from
         try func.lowerToStack(lhs);
