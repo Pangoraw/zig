@@ -2327,17 +2327,23 @@ fn airStore(func: *CodeGen, inst: Air.Inst.Index, safety: bool) InnerError!void 
         // load the value, and then shift+or the rhs into the result location.
         const int_elem_ty = try mod.intType(.unsigned, ptr_info.packed_offset.host_size * 8);
 
+        assert(ptr_info.flags.vector_index != .runtime);
+        const bit_offset: u16 = if (ptr_info.flags.vector_index != .none)
+            @intFromEnum(ptr_info.flags.vector_index) * @as(u16, @intCast(ty.bitSize(mod))) + ptr_info.packed_offset.bit_offset
+        else
+            ptr_info.packed_offset.bit_offset;
+
         if (isByRef(int_elem_ty, mod)) {
             return func.fail("TODO: airStore for pointers to bitfields with backing type larger than 64bits", .{});
         }
 
         var mask = @as(u64, @intCast((@as(u65, 1) << @as(u7, @intCast(ty.bitSize(mod)))) - 1));
-        mask <<= @as(u6, @intCast(ptr_info.packed_offset.bit_offset));
+        mask <<= @as(u6, @intCast(bit_offset));
         mask ^= ~@as(u64, 0);
         const shift_val = if (ptr_info.packed_offset.host_size <= 4)
-            WValue{ .imm32 = ptr_info.packed_offset.bit_offset }
+            WValue{ .imm32 = bit_offset }
         else
-            WValue{ .imm64 = ptr_info.packed_offset.bit_offset };
+            WValue{ .imm64 = bit_offset };
         const mask_val = if (ptr_info.packed_offset.host_size <= 4)
             WValue{ .imm32 = @as(u32, @truncate(mask)) }
         else
@@ -2347,7 +2353,7 @@ fn airStore(func: *CodeGen, inst: Air.Inst.Index, safety: bool) InnerError!void 
         const loaded = try func.load(lhs, int_elem_ty, 0);
         const anded = try func.binOp(loaded, mask_val, int_elem_ty, .@"and");
         const extended_value = try func.intcast(rhs, ty, int_elem_ty);
-        const shifted_value = if (ptr_info.packed_offset.bit_offset > 0) shifted: {
+        const shifted_value = if (bit_offset > 0) shifted: {
             break :shifted try func.binOp(extended_value, shift_val, int_elem_ty, .shl);
         } else extended_value;
         const result = try func.binOp(anded, shifted_value, int_elem_ty, .@"or");
@@ -4983,6 +4989,9 @@ fn airPtrElemPtr(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
     const elem_ty = ty_pl.ty.toType().childType(mod);
     const elem_size = elem_ty.abiSize(mod);
 
+    const inst_ty = func.typeOfIndex(inst);
+    const inst_info = inst_ty.ptrInfo(mod);
+
     const ptr = try func.resolveInst(bin_op.lhs);
     const index = try func.resolveInst(bin_op.rhs);
 
@@ -4993,11 +5002,16 @@ fn airPtrElemPtr(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
         try func.lowerToStack(ptr);
     }
 
-    // calculate index into ptr
-    try func.emitWValue(index);
-    try func.addImm32(@as(i32, @bitCast(@as(u32, @intCast(elem_size)))));
-    try func.addTag(.i32_mul);
-    try func.addTag(.i32_add);
+    if (inst_info.flags.vector_index == .none) {
+        // calculate index into ptr
+        try func.emitWValue(index);
+        try func.addImm32(@as(i32, @bitCast(@as(u32, @intCast(elem_size)))));
+        try func.addTag(.i32_mul);
+        try func.addTag(.i32_add);
+    } else {
+        // keep the ptr value as base
+        assert(inst_info.flags.vector_index != .runtime);
+    }
 
     const result = try func.allocLocal(Type.i32);
     try func.addLabel(.local_set, result.local.value);
@@ -5199,10 +5213,10 @@ fn loadFromArray(func: *CodeGen, array: WValue, index: WValue, array_ty: Type) I
     const vector_len = @as(usize, @intCast(array_ty.vectorLen(mod)));
 
     if (elem_bit_size % 8 != 0 and isByRef(array_ty, mod)) {
-        // (array[index * elem_bit_size / sz] >> (index % sz)) & 0x11
+        // (array[(index * elem_bit_size) / 8..((index + 1) * elem_bit_size) / 8] >> ((index * elem_bit_size) % 8)) & (2^elem_bit_size-1)
 
         if (elem_bit_size > 64) {
-            return func.fail("TODO: handle load from vector of type {}", .{array_ty.fmt(mod)});
+            return func.fail("TODO: handle unaligned load from vector of type {}", .{array_ty.fmt(mod)});
         }
 
         const load_ty = load_ty_blk: {
@@ -5226,23 +5240,23 @@ fn loadFromArray(func: *CodeGen, array: WValue, index: WValue, array_ty: Type) I
         };
         const load_ty_size = load_ty.bitSize(mod);
 
-        try func.lowerToStack(array);
-        try func.emitWValue(index);
-        const bit_index = try (try func.binOp(.stack, WValue{ .imm32 = @intCast(elem_bit_size) }, Type.u32, .mul)).toLocal(func, Type.u32);
-        var val = try func.binOp(.stack, WValue{ .imm32 = @intCast(load_ty_size) }, Type.u32, .div);
+        const bit_index = try (try func.binOp(index, WValue{ .imm32 = @intCast(elem_bit_size) }, Type.u32, .mul)).toLocal(func, Type.u32);
+
+        try func.emitWValue(array);
+        var val = try func.binOp(bit_index, WValue{ .imm32 = 8 }, Type.u32, .div); // byte-index
         std.debug.assert(val == .stack);
         try func.addTag(.i32_add);
-        const index_val = try func.load(.stack, load_ty, 0);
-        try func.emitWValue(index);
+
+        const index_val = try func.load(.stack, load_ty, array.offset());
 
         switch (toWasmBits(@intCast(load_ty_size)).?) {
             32 => {
-                val = try func.binOp(.stack, WValue{ .imm32 = @intCast(load_ty_size) }, load_ty, .rem);
+                val = try func.binOp(bit_index, WValue{ .imm32 = 8 }, load_ty, .rem);
                 val = try func.binOp(index_val, val, load_ty, .shr);
                 val = try func.binOp(val, WValue{ .imm32 = (@as(u32, 1) << @as(u5, @intCast(elem_bit_size))) - @as(u32, 1) }, load_ty, .@"and");
             },
             64 => {
-                val = try func.binOp(.stack, WValue{ .imm64 = @intCast(load_ty_size) }, load_ty, .rem);
+                val = try func.binOp(bit_index, WValue{ .imm64 = 8 }, load_ty, .rem);
                 val = try func.binOp(index_val, val, load_ty, .shr);
                 val = try func.binOp(val, WValue{ .imm64 = (@as(u64, 1) << @as(u6, @intCast(elem_bit_size))) - @as(u64, 1) }, load_ty, .@"and");
             },
@@ -5772,24 +5786,11 @@ fn airAggregateInit(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
                 const result = try func.allocStack(result_ty);
                 const elem_ty = result_ty.childType(mod);
                 const elem_size = @as(u32, @intCast(elem_ty.abiSize(mod)));
+                const elem_bit_size = elem_ty.bitSize(mod);
 
                 const sentinel = if (result_ty.sentinel(mod)) |sent| blk: {
                     break :blk try func.lowerConstant(sent, elem_ty);
                 } else null;
-
-                if (result_ty.zigTypeTag(mod) == .Vector and elem_ty.bitSize(mod) == 1) {
-                    for (elements, 0..) |elem, index| {
-                        const elem_val = try func.resolveInst(elem);
-                        try func.storeToBitArray(
-                            result,
-                            WValue{ .imm32 = @intCast(index) },
-                            elem_val,
-                            result_ty,
-                        );
-                    }
-                    std.debug.assert(sentinel == null);
-                    break :result_value result;
-                }
 
                 // When the element type is by reference, we must copy the entire
                 // value. It is therefore safer to move the offset pointer and store
@@ -5809,6 +5810,55 @@ fn airAggregateInit(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
                     if (sentinel) |sent| {
                         try func.store(offset, sent, elem_ty, 0);
                     }
+                } else if (result_ty.zigTypeTag(mod) == .Vector and elem_bit_size % 8 != 0) {
+                    const accum_ty = if (elem_ty.bitSize(mod) <= 32)
+                        Type.u32
+                    else
+                        Type.u64;
+                    const is_i32 = accum_ty.bitSize(mod) == 32;
+
+                    var accum = try func.allocLocal(accum_ty);
+                    defer accum.free(func);
+
+                    var bit_index: u64 = 0;
+                    for (elements, 0..) |elem, index| {
+                        const elem_val = try func.resolveInst(elem);
+                        if (index == 0) {
+                            try func.emitWValue(elem_val);
+                        } else {
+                            _ = try func.binOp(elem_val, if (is_i32)
+                                WValue{ .imm32 = @intCast(bit_index) }
+                            else
+                                WValue{ .imm64 = @intCast(bit_index) }, accum_ty, .shl);
+                            _ = try func.binOp(.stack, accum, accum_ty, .@"or");
+                        }
+                        try func.addLabel(.local_set, accum.local.value);
+
+                        bit_index = bit_index + elem_bit_size;
+                        while (bit_index >= 8) {
+                            try func.store(result, accum, Type.u8, @intCast((index * elem_bit_size) / 8));
+                            _ = try func.binOp(accum, if (is_i32) WValue{ .imm32 = 8 } else WValue{ .imm64 = 8 }, accum_ty, .shr);
+                            try func.addLabel(.local_set, accum.local.value);
+                            bit_index = bit_index - 8;
+                        }
+                    }
+                    // Store last byte
+                    if (bit_index > 0) {
+                        try func.store(result, accum, Type.u8, @intCast((elem_bit_size * elements.len) / 8));
+                        bit_index = 0;
+                    }
+
+                    // for (elements, 0..) |elem, index| {
+                    //     const elem_val = try func.resolveInst(elem);
+                    //     try func.storeToBitArray(
+                    //         result,
+                    //         WValue{ .imm32 = @intCast(index) },
+                    //         elem_val,
+                    //         result_ty,
+                    //     );
+                    // }
+                    std.debug.assert(sentinel == null);
+                    break :result_value result;
                 } else {
                     var offset: u32 = 0;
                     for (elements) |elem| {
