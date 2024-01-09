@@ -10996,12 +10996,12 @@ fn lowerFnRetTy(o: *Object, fn_info: InternPool.Key.FuncType) Allocator.Error!Bu
                     else => return lowerSystemVFnRetTy(o, fn_info),
                 },
                 .wasm32 => {
-                    if (isScalar(mod, return_type)) {
-                        return o.lowerType(return_type);
-                    }
                     const classes = wasm_c_abi.classifyType(return_type, mod);
                     if (classes[0] == .indirect or classes[0] == .none) {
                         return .void;
+                    }
+                    if (isScalar(mod, return_type)) {
+                        return o.lowerType(return_type);
                     }
 
                     assert(classes[0] == .direct and classes[1] == .none);
@@ -11225,12 +11225,12 @@ const ParamTypeIterator = struct {
                     .wasm32 => {
                         it.zig_index += 1;
                         it.llvm_index += 1;
-                        if (isScalar(mod, ty)) {
-                            return .byval;
-                        }
                         const classes = wasm_c_abi.classifyType(ty, mod);
                         if (classes[0] == .indirect) {
                             return .byref;
+                        }
+                        if (isScalar(mod, ty)) {
+                            return .byval;
                         }
                         return .abi_sized_int;
                     },

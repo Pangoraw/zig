@@ -45,7 +45,7 @@ pub fn classifyType(ty: Type, mod: *Module) [2]Class {
             }
             return classifyType(field_ty, mod);
         },
-        .Int, .Enum, .ErrorSet, .Vector => {
+        .Int, .Enum, .ErrorSet => {
             const int_bits = ty.intInfo(mod).bits;
             if (int_bits <= 64) return direct;
             if (int_bits <= 128) return .{ .direct, .direct };
@@ -58,6 +58,15 @@ pub fn classifyType(ty: Type, mod: *Module) [2]Class {
             return memory;
         },
         .Bool => return direct,
+        .Vector => {
+            if (ty.bitSize(mod) != 128) return memory;
+            const hasFeature = std.Target.wasm.featureSetHas;
+            const features = target.cpu.features;
+            if (hasFeature(features, .relaxed_simd) or hasFeature(features, .simd128)) {
+                return direct;
+            }
+            return memory;
+        },
         .Array => return memory,
         .Optional => {
             assert(ty.isPtrLikeOptional(mod));
