@@ -581,6 +581,14 @@ fn emitSimd(emit: *Emit, inst: Mir.Inst.Index) !void {
         .i64x2_bitmask,
         .v128_any_true,
         .v128_xor,
+        .f32x4_ceil,
+        .f32x4_floor,
+        .f32x4_nearest,
+        .f32x4_trunc,
+        .f64x2_ceil,
+        .f64x2_floor,
+        .f64x2_nearest,
+        .f64x2_trunc,
         => {}, // opcode already written
         else => |tag| return emit.fail("TODO: Implement simd instruction: {s}", .{@tagName(tag)}),
     }

@@ -2905,8 +2905,50 @@ fn airUnaryFloatOp(func: *CodeGen, inst: Air.Inst.Index, op: FloatOp) InnerError
 
 fn floatOp(func: *CodeGen, float_op: FloatOp, ty: Type, args: []const WValue) InnerError!WValue {
     const mod = func.bin_file.base.comp.module.?;
+
     if (ty.zigTypeTag(mod) == .Vector) {
-        return func.fail("TODO: Implement floatOps for vectors", .{});
+        const elem_ty = ty.childType(mod);
+        const elem_bit_size = elem_ty.bitSize(mod);
+        const vector_len = @as(usize, @intCast(ty.vectorLen(mod)));
+
+        if (args.len > 1) {
+            return func.fail("TODO: Implement floatOps for vectors", .{});
+        }
+
+        if (isByRef(ty, mod)) {
+            const elem_byte_size: u32 = @intCast(elem_ty.abiSize(mod));
+            const vector = args[0];
+            const result = try func.allocStack(ty);
+            for (0..vector_len) |index| {
+                try func.emitWValue(result);
+                const before = try func.loadFromArray(vector, .{ .imm32 = @intCast(index) }, ty);
+                const after = try func.floatOp(float_op, elem_ty, &.{before});
+                try func.store(
+                    .stack,
+                    after,
+                    elem_ty,
+                    @as(u32, @intCast(index)) * elem_byte_size + result.offset(),
+                );
+            }
+            return result;
+        }
+
+        if (elem_bit_size != 32 and elem_bit_size != 64) {
+            return func.fail("TODO: Implement floatOps for vectors", .{});
+        }
+
+        const is_f32 = elem_bit_size == 32;
+        const simd_opcode: wasm.SimdOpcode = switch (float_op) {
+            .ceil => if (is_f32) .f32x4_ceil else .f64x2_ceil,
+            .floor => if (is_f32) .f32x4_floor else .f64x2_floor,
+            .round => if (is_f32) .f32x4_nearest else .f64x2_nearest,
+            .trunc => if (is_f32) .f32x4_trunc else .f64x2_trunc,
+            else => return func.fail("TODO: Implement floatOps for vectors", .{}),
+        };
+
+        try func.emitWValue(args[0]);
+        try func.addSimd(simd_opcode);
+        return .stack;
     }
 
     const float_bits = ty.floatBits(func.target);
@@ -5266,12 +5308,21 @@ fn loadFromArray(func: *CodeGen, array: WValue, index: WValue, array_ty: Type) I
         return val;
     }
 
+    var offset: u32 = 0;
     if (isByRef(array_ty, mod)) {
-        try func.lowerToStack(array);
-        try func.emitWValue(index);
-        try func.addImm32(@as(i32, @bitCast(@as(u32, @intCast(elem_size)))));
-        try func.addTag(.i32_mul);
-        try func.addTag(.i32_add);
+        try func.emitWValue(array);
+        switch (index) {
+            inline .imm32, .imm64 => |const_index| {
+                // known index, compute the static byte offset
+                offset += @as(u32, @intCast(const_index)) * @as(u32, @intCast(elem_size));
+            },
+            else => {
+                try func.emitWValue(index);
+                try func.addImm32(@as(i32, @bitCast(@as(u32, @intCast(elem_size)))));
+                try func.addTag(.i32_mul);
+                try func.addTag(.i32_add);
+            },
+        }
     } else {
         switch (index) {
             inline .imm32, .imm64 => |lane| {
@@ -5308,7 +5359,7 @@ fn loadFromArray(func: *CodeGen, array: WValue, index: WValue, array_ty: Type) I
     }
 
     std.debug.assert(!isByRef(elem_ty, mod));
-    return func.load(.stack, elem_ty, 0);
+    return func.load(.stack, elem_ty, array.offset() + offset);
 }
 
 fn airArrayElemVal(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
