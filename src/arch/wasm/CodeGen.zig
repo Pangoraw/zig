@@ -5002,7 +5002,7 @@ fn airPtrElemPtr(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
         try func.lowerToStack(ptr);
     }
 
-    if (inst_info.flags.vector_index == .none) {
+    if (inst_info.packed_offset.bit_offset == 0) {
         // calculate index into ptr
         try func.emitWValue(index);
         try func.addImm32(@as(i32, @bitCast(@as(u32, @intCast(elem_size)))));
